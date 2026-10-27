@@ -14,14 +14,14 @@ const CHECKS = {
   panstwo: { wd: { classes: ['Q6256', 'Q3624078'] } },
   miasto: { wd: { classes: ['Q515', 'Q3957', 'Q7930989', 'Q1549591', 'Q5119'] } },
   rzeka: { wd: { classes: ['Q4022', 'Q47521'] } },
-  zwierze: { wd: { taxon: 'Q729' } },
-  roslina: { wd: { taxon: 'Q756' } },
-  imie: { wd: { classes: ['Q202444'] } },
+  zwierze: { wd: { taxon: 'Q729' }, wikt: { title: 'lower', test: /\{\{zool/ } },
+  roslina: { wd: { taxon: 'Q756' }, wikt: { title: 'lower', test: /\{\{bot/ } },
+  imie: { wd: { classes: ['Q202444'] }, wikt: { title: 'upper', test: /imi[ęo]/i } },
   zawod: { wd: { classes: ['Q28640', 'Q12737077'] } },
-  owoc: { wd: { classes: ['Q1364', 'Q11004', 'Q3314483'] } },
+  owoc: { wd: { classes: ['Q1364', 'Q11004', 'Q3314483'] }, wikt: { title: 'lower', test: /owoc|warzyw|\{\{bot/i } },
   kolor: { wd: { classes: ['Q1075'] } },
   sport: { wd: { classes: ['Q349', 'Q31629'] } },
-  rzecz: { wikt: true },
+  rzecz: { wikt: { title: 'lower', test: /rzeczownik/ } },
 };
 
 const INDEX = {};
@@ -113,27 +113,36 @@ async function sparqlPassing(ids, rule) {
   return new Set((data.results?.bindings || []).map((b) => b.item.value.split('/').pop()));
 }
 
-async function wiktionaryNouns(words) {
-  const ok = new Set();
-  for (let i = 0; i < words.length; i += 40) {
-    const batch = words.slice(i, i + 40);
-    const titles = batch.map((w) => w.toLocaleLowerCase('pl')).join('|');
+// Polskie sekcje haseł z Wikisłownika: Map(złożony tytuł → treść sekcji „język polski”).
+async function wiktionarySections(titles, stats) {
+  const out = new Map();
+  for (let i = 0; i < titles.length; i += 40) {
+    const batch = titles.slice(i, i + 40);
     const url = 'https://pl.wiktionary.org/w/api.php?action=query&format=json&formatversion=2&origin=*'
-      + '&prop=revisions&rvprop=content&rvslots=main&titles=' + encodeURIComponent(titles);
-    const data = await getJSON(url, 6000);
+      + '&prop=revisions&rvprop=content&rvslots=main&titles=' + encodeURIComponent(batch.join('|'));
+    stats.calls++;
+    let data;
+    try { data = await getJSON(url, 6000); } catch { stats.failed++; continue; }
     for (const page of data.query?.pages || []) {
       if (page.missing) continue;
       const text = page.revisions?.[0]?.slots?.main?.content || '';
       const pl = text.split(/\n==\s/).find((sec) => sec.includes('({{język polski}})'));
-      if (pl && /rzeczownik/.test(pl)) ok.add(fold(page.title));
+      if (pl) out.set(page.title, pl);
     }
   }
-  return ok;
+  return out;
 }
 
-// items: [{ cat, answer }] → Map("cat|złożona odpowiedź" → 'ok' | 'unknown')
+function titleVariant(answer, mode) {
+  const a = clean(answer).toLocaleLowerCase('pl');
+  return mode === 'upper' ? a.charAt(0).toLocaleUpperCase('pl') + a.slice(1) : a;
+}
+
+// items: [{ cat, answer }] → { result: Map("cat|złożona odpowiedź" → 'ok' | 'unknown'), offline: bool }
+// offline = żadne zapytanie do Wikidata/Wikisłownika się nie udało (np. brak internetu, blokada).
 export async function onlineCheck(items, { budgetMs = 10000 } = {}) {
   const result = new Map();
+  const stats = { calls: 0, failed: 0 };
   const key = (cat, a) => cat + '|' + fold(a);
   const uniq = new Map();
   for (const it of items) {
@@ -142,19 +151,26 @@ export async function onlineCheck(items, { budgetMs = 10000 } = {}) {
     result.set(k, 'unknown');
   }
   const list = [...uniq.values()];
+  const isOk = (it) => result.get(key(it.cat, it.answer)) === 'ok';
 
   const work = (async () => {
-    // Wikisłownik
+    // 1) Wikisłownik — jedno zbiorcze zapytanie, szybkie.
     const wikt = list.filter((it) => CHECKS[it.cat]?.wikt);
     if (wikt.length) {
-      try {
-        const nouns = await wiktionaryNouns(wikt.map((it) => clean(it.answer)));
-        for (const it of wikt) if (nouns.has(fold(it.answer))) result.set(key(it.cat, it.answer), 'ok');
-      } catch { /* zostaje unknown */ }
+      const titles = [...new Set(wikt.map((it) => titleVariant(it.answer, CHECKS[it.cat].wikt.title)))];
+      const sections = await wiktionarySections(titles, stats);
+      for (const it of wikt) {
+        const rule = CHECKS[it.cat].wikt;
+        const sec = sections.get(titleVariant(it.answer, rule.title));
+        if (sec && rule.test.test(sec)) result.set(key(it.cat, it.answer), 'ok');
+      }
     }
-    // Wikidata
-    const wd = list.filter((it) => CHECKS[it.cat]?.wd);
-    const cands = await pool(wd, 4, (it) => wikidataCandidates(clean(it.answer)));
+    // 2) Wikidata — dla tego, czego Wikisłownik nie potwierdził.
+    const wd = list.filter((it) => CHECKS[it.cat]?.wd && !isOk(it));
+    const cands = await pool(wd, 4, async (it) => {
+      stats.calls++;
+      try { return await wikidataCandidates(clean(it.answer)); } catch (e) { stats.failed++; throw e; }
+    });
     const byCat = new Map();
     wd.forEach((it, i) => {
       if (!cands[i]?.length) return;
@@ -163,7 +179,9 @@ export async function onlineCheck(items, { budgetMs = 10000 } = {}) {
     });
     await pool([...byCat.entries()], 3, async ([cat, entries]) => {
       const ids = [...new Set(entries.flatMap((e) => e.ids))].slice(0, 120);
-      const passing = await sparqlPassing(ids, CHECKS[cat].wd);
+      stats.calls++;
+      let passing;
+      try { passing = await sparqlPassing(ids, CHECKS[cat].wd); } catch (e) { stats.failed++; throw e; }
       for (const e of entries) {
         if (e.ids.some((id) => passing.has(id))) result.set(key(cat, e.it.answer), 'ok');
       }
@@ -171,7 +189,7 @@ export async function onlineCheck(items, { budgetMs = 10000 } = {}) {
   })();
 
   await Promise.race([work.catch(() => {}), new Promise((r) => setTimeout(r, budgetMs))]);
-  return result;
+  return { result, offline: stats.calls > 0 && stats.failed === stats.calls };
 }
 
 export function resultKey(cat, answer) {

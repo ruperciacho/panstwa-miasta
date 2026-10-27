@@ -90,11 +90,13 @@ export function drawLetter(used = [], rand = Math.random) {
 // Statusy automatycznego sprawdzania:
 //  ok      – potwierdzone (słownik / Wikidata / Wikisłownik) → zaliczone, chyba że większość zagłosuje przeciw
 //  manual  – kategoria bez automatu → zaliczone, chyba że większość zagłosuje przeciw
-//  unknown – nie znalazłem → niezaliczone, chyba że większość zagłosuje za
+//  unknown – nie znalazłem → zależy od ustawienia gry:
+//            luźne (domyślne): zaliczone, chyba że większość zagłosuje przeciw
+//            ścisłe: niezaliczone, chyba że większość zagłosuje za
 //  pending – trwa sprawdzanie online (traktowane jak unknown)
 //  bad     – zła litera / za krótkie → 0 pkt, bez głosowania
 //  empty   – brak odpowiedzi → 0 pkt
-export function isAccepted(auto, votes) {
+export function isAccepted(auto, votes, strict = false) {
   if (!auto || auto === 'empty' || auto === 'bad') return false;
   let up = 0;
   let down = 0;
@@ -102,7 +104,7 @@ export function isAccepted(auto, votes) {
     if (v > 0) up++;
     else if (v < 0) down++;
   }
-  if (auto === 'unknown' || auto === 'pending') return up > down;
+  if ((auto === 'unknown' || auto === 'pending') && strict) return up > down;
   return !(down > up);
 }
 
@@ -124,7 +126,7 @@ export function scoreRound(pids, categories, check) {
   }
   for (const c of categories) {
     const accepted = pids.filter((p) =>
-      isAccepted(check.auto?.[p]?.[c.id], check.votes?.[p]?.[c.id]));
+      isAccepted(check.auto?.[p]?.[c.id], check.votes?.[p]?.[c.id], !!check.strict));
     const counts = {};
     for (const p of accepted) {
       const k = fold(check.answers?.[p]?.[c.id]);
@@ -180,7 +182,7 @@ export function newGame(code, host) {
     code,
     hostId: host.id,
     phase: 'lobby',
-    settings: { rounds: 5, countdown: 20, categories: DEFAULT_CATEGORY_IDS.map(catById) },
+    settings: { rounds: 5, countdown: 20, strict: false, categories: DEFAULT_CATEGORY_IDS.map(catById) },
     players: { [host.id]: { name: host.name, score: 0, online: true } },
     order: [host.id],
     round: 0,

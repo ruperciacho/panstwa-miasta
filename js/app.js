@@ -55,7 +55,17 @@ const hostName = () => pname(state?.hostId);
 
 // ---------------------------------------------------------------- odpowiedzi gracza
 
-function ansKey(round = state?.round) { return `pm-ans-${session?.code}-${round}`; }
+function ansKey(round = state?.round) { return `pm-ans-${session?.code}-${state?.gameId || 0}-${round}`; }
+// Usuwa odpowiedzi z wcześniejszych rozgrywek (np. po „Zagraj jeszcze raz” z tym samym kodem).
+function pruneAnswers() {
+  const keep = `pm-ans-${session?.code}-${state?.gameId || 0}-`;
+  try {
+    for (let i = backing.length - 1; i >= 0; i--) {
+      const k = backing.key(i);
+      if (k && k.startsWith('pm-ans-') && !k.startsWith(keep)) backing.removeItem(k);
+    }
+  } catch { /* ignore */ }
+}
 function myAnswers() { return store.get(ansKey(), {}) || {}; }
 function saveAnswer(cat, value) {
   const a = myAnswers();
@@ -285,6 +295,7 @@ function removePlayer(id) {
 
 function hostStartGame() {
   if (state.phase !== 'lobby' && state.phase !== 'final') return;
+  state.gameId = G.uid().slice(0, 8);
   for (const id of state.order) state.players[id].score = 0;
   state.history = [];
   state.usedLetters = [];
@@ -368,7 +379,7 @@ function hostStartChecking() {
       if (st === 'pending') pending.push({ p, cat: c.id, answer: a });
     }
   }
-  state.check = { pids, answers, auto, votes: {}, validating: pending.length > 0 };
+  state.check = { pids, answers, auto, votes: {}, validating: pending.length > 0, strict: !!state.settings.strict, offline: false };
   state.phase = 'checking';
   commit();
   if (pending.length) runOnlineCheck();
@@ -384,7 +395,7 @@ async function runOnlineCheck() {
   }
   if (!pending.length) return;
   state.check.validating = true;
-  const res = await onlineCheck(pending.map((x) => ({ cat: x.cat, answer: x.answer })));
+  const { result: res, offline } = await onlineCheck(pending.map((x) => ({ cat: x.cat, answer: x.answer })));
   if (!state || state.phase !== 'checking' || state.round !== round) return;
   for (const x of pending) {
     if (state.check.auto[x.p][x.cat] === 'pending') {
@@ -392,6 +403,7 @@ async function runOnlineCheck() {
     }
   }
   state.check.validating = false;
+  state.check.offline = offline;
   commit();
 }
 
@@ -408,7 +420,7 @@ function hostVote(voter, target, cat, v) {
 }
 
 function hostConfirm() {
-  if (state.phase !== 'checking') return;
+  if (state.phase !== 'checking' || state.check.validating) return;
   // Odpowiedzi, których nie zdążyliśmy sprawdzić online, zostają do oceny przez głosy.
   for (const p of state.check.pids) {
     for (const c of state.settings.categories) {
@@ -507,6 +519,10 @@ const actions = {
   rounds(btn) {
     const d = Number(btn.dataset.d);
     state.settings.rounds = Math.min(G.MAX_ROUNDS, Math.max(1, state.settings.rounds + d));
+    commit();
+  },
+  strict(btn) {
+    state.settings.strict = btn.dataset.v === '1';
     commit();
   },
   countdown(btn) {
@@ -801,6 +817,11 @@ const BUILD = {
           <p class="setting-help">Gdy pierwsza osoba wypełni wszystko i wciśnie Stop, reszta ma tyle czasu na dokończenie.</p>
         </div>
         <div class="setting setting-col">
+          <span class="setting-name">Słowa, których aplikacja nie zna</span>
+          <div class="seg" id="strict" role="group" aria-label="Zasada dla nieznanych słów"></div>
+          <p class="setting-help" id="strictHelp"></p>
+        </div>
+        <div class="setting setting-col">
           <span class="setting-name">Kategorie</span>
           <div class="chips" id="cats"></div>
           ${host ? `<form class="addcat" id="addcatForm">
@@ -895,6 +916,7 @@ const MOUNT = {
     });
   },
   play() {
+    pruneAnswers();
     const inputs = [...document.querySelectorAll('#sheet input')];
     inputs.forEach((inp, i) => {
       inp.addEventListener('input', () => {
@@ -944,6 +966,16 @@ const UPDATE = {
         ? `<button type="button" data-act="countdown" data-s="${s}" aria-pressed="${on}" class="${on ? 'on' : ''}">${s} s</button>`
         : `<span class="${on ? 'on' : 'off'}">${s} s</span>`;
     }).join('');
+    const strict = !!state.settings.strict;
+    document.getElementById('strict').innerHTML = [[false, 'Liczą się'], [true, 'Wymagają ✓']].map(([v, label]) => {
+      const on = v === strict;
+      return host
+        ? `<button type="button" data-act="strict" data-v="${v ? 1 : 0}" aria-pressed="${on}" class="${on ? 'on' : ''}">${label}</button>`
+        : `<span class="${on ? 'on' : 'off'}">${label}</span>`;
+    }).join('');
+    document.getElementById('strictHelp').textContent = strict
+      ? 'Słowo spoza słownika dostaje punkty dopiero, gdy większość da ✓.'
+      : 'Słowo spoza słownika dostaje punkty, chyba że większość da ✗.';
     const selected = new Set(state.settings.categories.map((c) => c.id));
     const opts = host ? allCategoryOptions() : allCategoryOptions().filter((o) => selected.has(o.id));
     document.getElementById('cats').innerHTML = opts.map((o) => {
@@ -1044,7 +1076,11 @@ const UPDATE = {
     const intro = document.getElementById('checkIntro');
     intro.innerHTML = c.validating
       ? 'Szukam nieznanych słów w Wikidata i Wikisłowniku…'
-      : 'Zaznacz ✓ albo ✗ przy wątpliwych odpowiedziach. Decyduje większość głosów.';
+      : c.offline
+        ? 'Nie udało się połączyć z Wikidata, więc słowa spoza słownika oceniacie sami: ✓ albo ✗.'
+        : c.strict
+          ? 'Słowa, których nie znam, dostaną punkty tylko z ✓ od większości.'
+          : 'Słowa, których nie znam, liczą się, chyba że większość da ✗.';
     document.getElementById('checkList').innerHTML = cats.map((cat) => `
       <section class="cat-block">
         <h3 class="cat-title">${esc(cat.name)}</h3>
@@ -1052,8 +1088,20 @@ const UPDATE = {
       </section>`).join('') + legend();
     const dock = document.getElementById('dock');
     if (isHost()) {
-      dock.innerHTML = `<button type="button" class="btn btn-ink btn-big" data-act="confirm">Zatwierdź punkty</button>
-        <p class="dock-hint">${c.validating ? 'Jeszcze sprawdzam online — możesz poczekać chwilę.' : 'Zatwierdź, gdy wszyscy zagłosują.'}</p>`;
+      let unvoted = 0;
+      for (const p of c.pids) {
+        for (const cat of cats) {
+          const st = c.auto[p]?.[cat.id];
+          const v = c.votes?.[p]?.[cat.id] || {};
+          if ((st === 'unknown' || st === 'pending') && !Object.keys(v).length) unvoted++;
+        }
+      }
+      const hint = c.validating ? 'Szukam słów spoza słownika, to trwa do 10 sekund.'
+        : !unvoted ? 'Zatwierdź, gdy wszyscy zagłosują.'
+          : c.strict ? `${unvoted} ${plural(unvoted, 'nieznane słowo', 'nieznane słowa', 'nieznanych słów')} bez ✓ dostanie 0 pkt.`
+            : `${unvoted} ${plural(unvoted, 'nieznane słowo', 'nieznane słowa', 'nieznanych słów')} policzę, jeśli nikt nie da ✗.`;
+      dock.innerHTML = `<button type="button" class="btn btn-ink btn-big" data-act="confirm" ${c.validating ? 'disabled' : ''}>${c.validating ? 'Sprawdzam odpowiedzi…' : 'Zatwierdź punkty'}</button>
+        <p class="dock-hint">${hint}</p>`;
     } else {
       dock.innerHTML = `<p class="dock-wait">${esc(hostName())} zatwierdzi punkty, gdy skończycie głosować.</p>`;
     }
@@ -1107,7 +1155,7 @@ function setDock(dock, mode, html) {
 const STATUS_TEXT = {
   ok: 'pasuje',
   manual: 'do oceny',
-  unknown: 'nie znam, głosujcie',
+  unknown: 'nie znam',
   pending: 'sprawdzam…',
   bad: 'zła litera',
   empty: 'brak',
@@ -1121,12 +1169,13 @@ function answerRow(p, cat, preview) {
   const up = Object.values(votes).filter((v) => v > 0).length;
   const down = Object.values(votes).filter((v) => v < 0).length;
   const mine = votes[me.id] || 0;
-  const accepted = G.isAccepted(st, votes);
+  const accepted = G.isAccepted(st, votes, !!c.strict);
   const pts = preview[p]?.[cat.id] ?? 0;
   const voting = G.canVote(st) && p !== me.id;
   let note = STATUS_TEXT[st];
   if (G.canVote(st) && (up || down)) note = accepted ? 'zaliczone głosami' : 'odrzucone głosami';
   if (st === 'ok' && !(up || down)) note = 'pasuje';
+  if (st === 'unknown' && !(up || down)) note = c.strict ? 'nie znam — zaliczyć? daj ✓' : 'nie znam — liczę, chyba że ✗';
   return `<li class="ans st-${st} ${accepted ? 'acc' : 'rej'} ${up || down ? 'voted' : ''} ${p === me.id ? 'mine' : ''}">
     <span class="ans-who">${esc(pname(p))}${p === me.id ? ' (Ty)' : ''}</span>
     <span class="ans-word">${word ? esc(word) : '—'}</span>
@@ -1143,7 +1192,7 @@ function legend() {
   return `<details class="legend">
     <summary>Jak liczę punkty?</summary>
     <p><b>15</b> — tylko Ty masz zaliczoną odpowiedź w tej kategorii. <b>10</b> — Twoja odpowiedź jest inna niż wszystkich. <b>5</b> — ktoś napisał to samo. <b>0</b> — brak, zła litera albo odrzucone.</p>
-    <p>„Pasuje” — znalazłem w słowniku lub w Wikidata; liczy się, chyba że większość da ✗. „Nie znam” — liczy się tylko, jeśli większość da ✓. „Do oceny” — kategoria bez automatu; liczy się, chyba że większość da ✗.</p>
+    <p>„Pasuje” — znalazłem w słowniku, Wikidata albo Wikisłowniku; liczy się, chyba że większość da ✗. „Nie znam” — ${state.check?.strict ? 'liczy się tylko, jeśli większość da ✓' : 'liczy się, chyba że większość da ✗'} (gospodarz zmienia to w poczekalni). „Do oceny” — kategoria bez automatu; liczy się, chyba że większość da ✗. Zła litera i brak to zawsze 0.</p>
   </details>`;
 }
 

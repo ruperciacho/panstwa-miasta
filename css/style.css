@@ -620,3 +620,7 @@ button { cursor: pointer; }
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
   .reveal .ring path { stroke-dashoffset: 0; }
 }
+
+/* nieznane słowo bez głosów — wyróżnione, żeby nikt go nie przeoczył */
+.ans.st-unknown:not(.voted) { background: linear-gradient(90deg, var(--marker), transparent 75%); margin-left: -8px; padding-left: 8px; border-radius: 6px 0 0 6px; }
+.ans.st-unknown.acc:not(.voted) .ans-note { color: var(--text); }
