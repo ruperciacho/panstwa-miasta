@@ -43,6 +43,8 @@ const ui = {
   revealSpin: 0,
   hostGoneSince: 0,
   lastJoinSent: 0,
+  want: {}, // głosy gracza: "target|cat" → { v, at } — wysyłane ponownie, dopóki gospodarz ich nie uwzględni
+  wantRound: 0,
 };
 
 const app = document.getElementById('app');
@@ -190,11 +192,79 @@ function applyRemoteState(s) {
   clearTimeout(ui.joinTimer);
   if (!state.players[me.id] || state.players[me.id].left) sendJoin(false);
   if (state.phase === 'collecting') sendAnswersOnce();
+  resendVotes();
   if (state.phase === 'closed') {
     disconnect(true);
     ui.error = 'Gospodarz zakończył grę.';
   }
   render();
+}
+
+// ---------------------------------------------------------------- głosy gracza
+
+function resetWantIfNeeded() {
+  const tag = state?.phase === 'checking' ? state.round : 0;
+  if (ui.wantRound !== tag) {
+    ui.want = {};
+    ui.wantRound = tag;
+  }
+}
+
+function myVote(target, cat) {
+  const w = !isHost() && ui.want[target + '|' + cat];
+  if (w && ui.wantRound === state.round) return w.v;
+  return state.check?.votes?.[target]?.[cat]?.[me.id] || 0;
+}
+
+// Głos, którego gospodarz jeszcze nie ma (np. miał grę w tle, bo sprawdzał coś w Google) — wyślij ponownie.
+function resendVotes(force = false) {
+  if (isHost() || !state) return;
+  resetWantIfNeeded();
+  if (state.phase !== 'checking') return;
+  const now = Date.now();
+  for (const [k, w] of Object.entries(ui.want)) {
+    const [target, cat] = k.split('|');
+    const have = state.check?.votes?.[target]?.[cat]?.[me.id] || 0;
+    if (have === w.v) continue;
+    if (!force && now - w.at < 1500) continue;
+    w.at = now;
+    send({ t: 'vote', target, cat, v: w.v });
+  }
+}
+
+// Stan sprawdzania z naszymi głosami nałożonymi od razu — przyciski reagują bez czekania na gospodarza.
+function viewCheck() {
+  const c = state.check;
+  if (isHost() || ui.wantRound !== state.round || !Object.keys(ui.want).length) return c;
+  const votes = JSON.parse(JSON.stringify(c.votes || {}));
+  for (const [k, w] of Object.entries(ui.want)) {
+    const [target, cat] = k.split('|');
+    votes[target] ??= {};
+    votes[target][cat] ??= {};
+    if (w.v) votes[target][cat][me.id] = w.v;
+    else delete votes[target][cat][me.id];
+  }
+  return { ...c, votes };
+}
+
+// Pytanie do Google, które ma pomóc zdecydować: zaliczyć czy nie.
+const QUERY = {
+  rzecz: (w) => `co to jest ${w}`,
+  slawny: (w) => `kim jest ${w}`,
+  film: (w) => `${w} film serial`,
+  owoc: (w) => `czy ${w} to owoc czy warzywo`,
+};
+function googleQuery(word, cat) {
+  const w = G.clean(word);
+  if (QUERY[cat.id]) return QUERY[cat.id](w);
+  return `czy ${w} to ${cat.name.toLocaleLowerCase('pl')}`;
+}
+function googleLink(word, cat) {
+  const q = googleQuery(word, cat);
+  const href = 'https://www.google.com/search?hl=pl&q=' + encodeURIComponent(q);
+  return `<a class="gcheck" href="${esc(href)}" target="_blank" rel="noopener noreferrer" title="${esc(q)}" aria-label="Sprawdź w Google: ${esc(q)}">`
+    + '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.8" cy="6.8" r="4.6"/><path d="M10.3 10.3 14.2 14.2"/></svg>'
+    + 'Sprawdź w Google</a>';
 }
 
 function sendAnswersOnce() {
@@ -414,8 +484,10 @@ function hostVote(voter, target, cat, v) {
   state.check.votes[target] ??= {};
   state.check.votes[target][cat] ??= {};
   const cell = state.check.votes[target][cat];
-  if (!v || cell[voter] === v) delete cell[voter];
-  else cell[voter] = v > 0 ? 1 : -1;
+  const nv = v > 0 ? 1 : v < 0 ? -1 : 0;
+  if ((cell[voter] || 0) === nv) { rebroadcast(); return; }
+  if (nv) cell[voter] = nv;
+  else delete cell[voter];
   commit();
 }
 
@@ -585,10 +657,16 @@ const actions = {
     const target = btn.dataset.t;
     const cat = btn.dataset.c;
     const v = Number(btn.dataset.v);
-    const cur = state.check?.votes?.[target]?.[cat]?.[me.id] || 0;
+    const cur = myVote(target, cat);
     const nv = cur === v ? 0 : v;
-    if (isHost()) hostVote(me.id, target, cat, nv);
-    else send({ t: 'vote', target, cat, v: nv });
+    if (isHost()) {
+      hostVote(me.id, target, cat, nv);
+      return;
+    }
+    resetWantIfNeeded();
+    ui.want[target + '|' + cat] = { v: nv, at: Date.now() };
+    send({ t: 'vote', target, cat, v: nv });
+    UPDATE.check();
   },
   confirm() { hostConfirm(); },
   next() { hostNext(); },
@@ -1070,7 +1148,7 @@ const UPDATE = {
   },
 
   check() {
-    const c = state.check;
+    const c = viewCheck();
     const cats = state.settings.categories;
     const preview = G.scoreRound(c.pids, cats, c).cells;
     const intro = document.getElementById('checkIntro');
@@ -1084,7 +1162,7 @@ const UPDATE = {
     document.getElementById('checkList').innerHTML = cats.map((cat) => `
       <section class="cat-block">
         <h3 class="cat-title">${esc(cat.name)}</h3>
-        <ul class="answers">${c.pids.map((p) => answerRow(p, cat, preview)).join('')}</ul>
+        <ul class="answers">${c.pids.map((p) => answerRow(c, p, cat, preview)).join('')}</ul>
       </section>`).join('') + legend();
     const dock = document.getElementById('dock');
     if (isHost()) {
@@ -1152,6 +1230,9 @@ function setDock(dock, mode, html) {
   }
 }
 
+// Odpowiedzi, których nie potwierdził słownik ani sprawdzanie online — przy nich link do Google.
+const DOUBTFUL = new Set(['unknown', 'pending', 'manual']);
+
 const STATUS_TEXT = {
   ok: 'pasuje',
   manual: 'do oceny',
@@ -1161,8 +1242,7 @@ const STATUS_TEXT = {
   empty: 'brak',
 };
 
-function answerRow(p, cat, preview) {
-  const c = state.check;
+function answerRow(c, p, cat, preview) {
   const word = c.answers[p]?.[cat.id] || '';
   const st = c.auto[p]?.[cat.id] || 'empty';
   const votes = c.votes?.[p]?.[cat.id] || {};
@@ -1179,7 +1259,7 @@ function answerRow(p, cat, preview) {
   return `<li class="ans st-${st} ${accepted ? 'acc' : 'rej'} ${up || down ? 'voted' : ''} ${p === me.id ? 'mine' : ''}">
     <span class="ans-who">${esc(pname(p))}${p === me.id ? ' (Ty)' : ''}</span>
     <span class="ans-word">${word ? esc(word) : '—'}</span>
-    <span class="ans-note">${note}</span>
+    <span class="ans-note">${note}${word && DOUBTFUL.has(st) ? googleLink(word, cat) : ''}</span>
     <span class="ans-votes">${G.canVote(st) ? `
       <button type="button" class="vote up ${mine > 0 ? 'on' : ''}" data-act="vote" data-t="${esc(p)}" data-c="${esc(cat.id)}" data-v="1" ${voting ? '' : 'disabled'} aria-label="Zaliczam">✓ <b>${up}</b></button>
       <button type="button" class="vote down ${mine < 0 ? 'on' : ''}" data-act="vote" data-t="${esc(p)}" data-c="${esc(cat.id)}" data-v="-1" ${voting ? '' : 'disabled'} aria-label="Nie zaliczam">✗ <b>${down}</b></button>` : ''}
@@ -1237,6 +1317,7 @@ document.addEventListener('visibilitychange', () => {
 
 setInterval(() => {
   hostTick();
+  resendVotes();
   const name = ui.mounted.split(':')[0];
   if (name === 'play') UPDATE.play();
   if (name === 'lobby' || name === 'play' || name === 'check') renderStatus();
